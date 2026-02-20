@@ -72,6 +72,15 @@ def init_tables():
         description TEXT,
         day_of_month INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS chat_history (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp FLOAT NOT NULL,
+        date TEXT NOT NULL
+    );
     """
     res = requests.post(
         f"{SUPABASE_URL}/rest/v1/rpc/exec_sql",
@@ -479,6 +488,144 @@ def delete_recurring_expense(username: str, password: str, expense_id: int) -> s
     if count > 0:
         return f"Recurring expense #{expense_id} deleted"
     return f"Recurring expense #{expense_id} not found or does not belong to you"
+
+
+# --------------------- CHAT HISTORY TOOLS ---------------------
+
+@mcp.tool()
+def save_chat_message(username: str, password: str, role: str, content: str) -> str:
+    """
+    Save a single chat message to the user's history.
+    role must be 'user' or 'assistant'.
+    """
+    user = auth(username, password)
+    if not user:
+        return "Invalid username or password"
+
+    if role not in ("user", "assistant"):
+        return "role must be 'user' or 'assistant'"
+    if not content.strip():
+        return "content cannot be empty"
+
+    now = datetime.now()
+    sb_post("chat_history", {
+        "user_id": user["id"],
+        "role": role,
+        "content": content.strip(),
+        "timestamp": now.timestamp(),
+        "date": now.isoformat()
+    })
+    return "Message saved"
+
+
+@mcp.tool()
+def save_chat_exchange(username: str, password: str, user_message: str, assistant_message: str) -> str:
+    """
+    Save a user + assistant message pair in one call (more efficient than two separate saves).
+    Use this after every chat turn to persist the conversation.
+    """
+    user = auth(username, password)
+    if not user:
+        return "Invalid username or password"
+
+    if not user_message.strip() or not assistant_message.strip():
+        return "Both user_message and assistant_message must be non-empty"
+
+    now = datetime.now()
+    ts = now.timestamp()
+    date_str = now.isoformat()
+
+    sb_post("chat_history", {
+        "user_id": user["id"],
+        "role": "user",
+        "content": user_message.strip(),
+        "timestamp": ts,
+        "date": date_str
+    })
+    sb_post("chat_history", {
+        "user_id": user["id"],
+        "role": "assistant",
+        "content": assistant_message.strip(),
+        "timestamp": ts + 0.001,   # keep ordering deterministic
+        "date": date_str
+    })
+    return "Chat exchange saved"
+
+
+@mcp.tool()
+def get_chat_history(username: str, password: str, limit: int = 50) -> str:
+    """
+    Retrieve the most recent chat messages for the user (up to `limit` messages).
+    Returns messages in chronological order (oldest first).
+    Use this on login to restore conversation context.
+    """
+    user = auth(username, password)
+    if not user:
+        return "Invalid username or password"
+
+    if limit < 1 or limit > 200:
+        return "limit must be between 1 and 200"
+
+    # Fetch most recent `limit` rows ordered descending, then reverse for chronological order
+    rows = sb_get("chat_history", {
+        "user_id": f"eq.{user['id']}",
+        "order": "timestamp.desc",
+        "limit": str(limit)
+    })
+
+    if not rows:
+        return "No chat history found"
+
+    rows = list(reversed(rows))   # chronological order
+
+    result = f"Chat History for '{user['name']}' ({len(rows)} messages):\n\n"
+    for row in rows:
+        date = datetime.fromisoformat(row["date"]).strftime("%Y-%m-%d %H:%M")
+        role_label = "You" if row["role"] == "user" else "Assistant"
+        result += f"[{date}] {role_label}: {row['content']}\n\n"
+
+    return result.strip()
+
+
+@mcp.tool()
+def get_chat_history_raw(username: str, password: str, limit: int = 50) -> str:
+    """
+    Retrieve chat history as a JSON-serialisable string of message dicts
+    [{"role": "user"|"assistant", "content": "...""}, ...] in chronological order.
+    Use this when you need to reconstruct LangChain/LLM message objects on login.
+    """
+    import json
+
+    user = auth(username, password)
+    if not user:
+        return "Invalid username or password"
+
+    if limit < 1 or limit > 200:
+        return "limit must be between 1 and 200"
+
+    rows = sb_get("chat_history", {
+        "user_id": f"eq.{user['id']}",
+        "order": "timestamp.desc",
+        "limit": str(limit)
+    })
+
+    if not rows:
+        return "[]"
+
+    rows = list(reversed(rows))
+    messages = [{"role": r["role"], "content": r["content"]} for r in rows]
+    return json.dumps(messages)
+
+
+@mcp.tool()
+def clear_chat_history(username: str, password: str) -> str:
+    """Delete all chat history for the user."""
+    user = auth(username, password)
+    if not user:
+        return "Invalid username or password"
+
+    sb_delete("chat_history", {"user_id": f"eq.{user['id']}"})
+    return "Chat history cleared"
 
 
 # --------------------- RUN SERVER ---------------------
