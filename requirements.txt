@@ -7,3 +7,7 @@ langgraph
 fastmcp
 langchain-groq
 nest_asyncio
+fastmcp
+pymongo
+dnspython
+python-dotenv
