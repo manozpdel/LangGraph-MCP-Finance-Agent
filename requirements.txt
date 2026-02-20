@@ -5,3 +5,5 @@ langchain-mcp-adapters
 langchain-core
 langgraph
 fastmcp
+langchain-groq
+nest_asyncio

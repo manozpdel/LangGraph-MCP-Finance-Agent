@@ -1,10 +1,13 @@
 import logging
 import os
-import sqlite3
 from datetime import datetime
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastmcp import FastMCP
+from pymongo import MongoClient
 
 # --------------------- LOGGING SETUP ---------------------
 
@@ -17,60 +20,19 @@ logger = logging.getLogger(__name__)
 # --------------------- INIT ---------------------
 
 mcp = FastMCP("ExpenseTracker")
-DB_FILE = os.getenv("EXPENSES_DB", "/tmp/expenses.db")
 
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise ValueError("MONGO_URI environment variable is not set")
 
-# --------------------- DATABASE SETUP ---------------------
+client = MongoClient(MONGO_URI)
+db = client["expense_tracker"]
 
-def init_db():
-    """Initialize SQLite database and create tables if not exists"""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+expenses_col = db["expenses"]
+budgets_col = db["budgets"]
+recurring_col = db["recurring_expenses"]
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            amount REAL NOT NULL,
-            category TEXT NOT NULL,
-            description TEXT,
-            date TEXT NOT NULL,
-            timestamp REAL NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS budgets (
-            user_id TEXT,
-            month INTEGER,
-            year INTEGER,
-            amount REAL,
-            PRIMARY KEY(user_id, month, year)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS recurring_expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            amount REAL NOT NULL,
-            category TEXT NOT NULL,
-            description TEXT,
-            day_of_month INTEGER NOT NULL
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized successfully")
-
-
-def get_connection():
-    """Create new database connection"""
-    return sqlite3.connect(DB_FILE)
-
-
-init_db()
+logger.info("Connected to MongoDB Atlas successfully")
 
 
 # --------------------- INPUT VALIDATION ---------------------
@@ -103,17 +65,15 @@ def add_expense(user_id: str, amount: float, category: str, description: str = "
     if err := validate_category(category):
         return err
 
-    conn = get_connection()
-    cursor = conn.cursor()
     now = datetime.now()
-
-    cursor.execute("""
-        INSERT INTO expenses (user_id, amount, category, description, date, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, amount, category.strip(), description, now.isoformat(), now.timestamp()))
-
-    conn.commit()
-    conn.close()
+    expenses_col.insert_one({
+        "user_id": user_id,
+        "amount": amount,
+        "category": category.strip(),
+        "description": description,
+        "date": now.isoformat(),
+        "timestamp": now.timestamp()
+    })
 
     logger.info(f"User '{user_id}' added expense ${amount:.2f} in category '{category}'")
     return f"✅ Expense added: ${amount:.2f} for {category}"
@@ -124,37 +84,23 @@ def add_expense(user_id: str, amount: float, category: str, description: str = "
 @mcp.tool()
 def get_expenses(user_id: str, category: str = None, limit: int = 10) -> str:
     """Get recent expenses for a user, optionally filtered by category"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
+    query = {"user_id": user_id}
     if category:
-        cursor.execute("""
-            SELECT id, amount, category, description, date
-            FROM expenses
-            WHERE user_id = ? AND LOWER(category) = LOWER(?)
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (user_id, category, limit))
-    else:
-        cursor.execute("""
-            SELECT id, amount, category, description, date
-            FROM expenses
-            WHERE user_id = ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-        """, (user_id, limit))
+        query["category"] = {"$regex": f"^{category}$", "$options": "i"}
 
-    rows = cursor.fetchall()
-    conn.close()
+    rows = list(expenses_col.find(query).sort("timestamp", -1).limit(limit))
 
     if not rows:
         return "No expenses found"
 
     result = f"📊 Recent Expenses for '{user_id}' ({len(rows)} shown):\n\n"
     for row in rows:
-        exp_id, amount, cat, desc, date_str = row
-        date = datetime.fromisoformat(date_str).strftime("%Y-%m-%d %H:%M")
-        result += f"• [#{exp_id}] ${amount:.2f} - {cat} - {date}\n"
+        exp_id = str(row["_id"])
+        amount = row["amount"]
+        cat = row["category"]
+        desc = row.get("description", "")
+        date = datetime.fromisoformat(row["date"]).strftime("%Y-%m-%d %H:%M")
+        result += f"• [#{exp_id[-6:]}] ${amount:.2f} - {cat} - {date}\n"
         if desc:
             result += f"  Description: {desc}\n"
 
@@ -167,30 +113,23 @@ def get_expenses(user_id: str, category: str = None, limit: int = 10) -> str:
 @mcp.tool()
 def get_total_by_category(user_id: str) -> str:
     """Get total expenses grouped by category for a user"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT category, SUM(amount)
-        FROM expenses
-        WHERE user_id = ?
-        GROUP BY category
-        ORDER BY SUM(amount) DESC
-    """, (user_id,))
-
-    rows = cursor.fetchall()
-    conn.close()
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {"_id": "$category", "total": {"$sum": "$amount"}}},
+        {"$sort": {"total": -1}}
+    ]
+    rows = list(expenses_col.aggregate(pipeline))
 
     if not rows:
         return "No expenses recorded yet"
 
     result = f"💰 Total Expenses by Category for '{user_id}':\n\n"
-    total = 0
-    for category, amount in rows:
-        result += f"• {category}: ${amount:.2f}\n"
-        total += amount
+    grand_total = 0
+    for row in rows:
+        result += f"• {row['_id']}: ${row['total']:.2f}\n"
+        grand_total += row["total"]
 
-    result += f"\n🔢 Grand Total: ${total:.2f}"
+    result += f"\n🔢 Grand Total: ${grand_total:.2f}"
     logger.info(f"User '{user_id}' fetched category totals")
     return result
 
@@ -198,56 +137,47 @@ def get_total_by_category(user_id: str) -> str:
 # ---- 4. Delete Expense ----
 
 @mcp.tool()
-def delete_expense(user_id: str, expense_id: int) -> str:
+def delete_expense(user_id: str, expense_id: str) -> str:
     """Delete an expense by ID (only if it belongs to the user)"""
-    conn = get_connection()
-    cursor = conn.cursor()
+    from bson import ObjectId
+    try:
+        result = expenses_col.delete_one({"_id": ObjectId(expense_id), "user_id": user_id})
+    except Exception:
+        return f"❌ Invalid expense ID format"
 
-    cursor.execute("DELETE FROM expenses WHERE id = ? AND user_id = ?", (expense_id, user_id))
-    conn.commit()
-
-    if cursor.rowcount > 0:
-        conn.close()
+    if result.deleted_count > 0:
         logger.info(f"User '{user_id}' deleted expense #{expense_id}")
         return f"✅ Expense #{expense_id} deleted successfully"
     else:
-        conn.close()
         return f"❌ Expense #{expense_id} not found or doesn't belong to user '{user_id}'"
 
 
-# ---- 5. Monthly Summary (SQL-level filtering) ----
+# ---- 5. Monthly Summary ----
 
 @mcp.tool()
 def get_monthly_summary(user_id: str, month: int = None, year: int = None) -> str:
-    """Get expense summary for a specific month using SQL filtering"""
+    """Get expense summary for a specific month"""
     now = datetime.now()
     month = month or now.month
     year = year or now.year
 
     month_str = str(month).zfill(2)
     year_str = str(year)
+    prefix = f"{year_str}-{month_str}"
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT amount, category
-        FROM expenses
-        WHERE user_id = ?
-          AND strftime('%m', date) = ?
-          AND strftime('%Y', date) = ?
-    """, (user_id, month_str, year_str))
-
-    rows = cursor.fetchall()
-    conn.close()
+    rows = list(expenses_col.find({
+        "user_id": user_id,
+        "date": {"$regex": f"^{prefix}"}
+    }))
 
     if not rows:
         return f"No expenses found for {month}/{year}"
 
-    total = sum(r[0] for r in rows)
+    total = sum(r["amount"] for r in rows)
     category_totals = {}
-    for amount, category in rows:
-        category_totals[category] = category_totals.get(category, 0) + amount
+    for row in rows:
+        cat = row["category"]
+        category_totals[cat] = category_totals.get(cat, 0) + row["amount"]
 
     result = f"📅 Summary for '{user_id}' — {month}/{year}:\n\n"
     result += f"Total Expenses: ${total:.2f}\n"
@@ -264,8 +194,10 @@ def get_monthly_summary(user_id: str, month: int = None, year: int = None) -> st
 # ---- 6. Update Expense ----
 
 @mcp.tool()
-def update_expense(user_id: str, expense_id: int, amount: float = None, category: str = None, description: str = None) -> str:
+def update_expense(user_id: str, expense_id: str, amount: float = None, category: str = None, description: str = None) -> str:
     """Update an existing expense's amount, category, or description"""
+    from bson import ObjectId
+
     if amount is not None:
         if err := validate_amount(amount):
             return err
@@ -273,23 +205,24 @@ def update_expense(user_id: str, expense_id: int, amount: float = None, category
         if err := validate_category(category):
             return err
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        obj_id = ObjectId(expense_id)
+    except Exception:
+        return "❌ Invalid expense ID format"
 
-    cursor.execute("SELECT id FROM expenses WHERE id = ? AND user_id = ?", (expense_id, user_id))
-    if not cursor.fetchone():
-        conn.close()
+    if not expenses_col.find_one({"_id": obj_id, "user_id": user_id}):
         return f"❌ Expense #{expense_id} not found or doesn't belong to user '{user_id}'"
 
+    updates = {}
     if amount is not None:
-        cursor.execute("UPDATE expenses SET amount = ? WHERE id = ?", (amount, expense_id))
+        updates["amount"] = amount
     if category is not None:
-        cursor.execute("UPDATE expenses SET category = ? WHERE id = ?", (category.strip(), expense_id))
+        updates["category"] = category.strip()
     if description is not None:
-        cursor.execute("UPDATE expenses SET description = ? WHERE id = ?", (description, expense_id))
+        updates["description"] = description
 
-    conn.commit()
-    conn.close()
+    if updates:
+        expenses_col.update_one({"_id": obj_id}, {"$set": updates})
 
     logger.info(f"User '{user_id}' updated expense #{expense_id}")
     return f"✅ Expense #{expense_id} updated successfully"
@@ -307,17 +240,11 @@ def set_budget(user_id: str, amount: float, month: int = None, year: int = None)
     month = month or now.month
     year = year or now.year
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO budgets (user_id, month, year, amount)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id, month, year) DO UPDATE SET amount = excluded.amount
-    """, (user_id, month, year, amount))
-
-    conn.commit()
-    conn.close()
+    budgets_col.update_one(
+        {"user_id": user_id, "month": month, "year": year},
+        {"$set": {"amount": amount}},
+        upsert=True
+    )
 
     logger.info(f"User '{user_id}' set budget ${amount:.2f} for {month}/{year}")
     return f"✅ Budget set to ${amount:.2f} for {month}/{year}"
@@ -330,35 +257,23 @@ def check_budget_status(user_id: str, month: int = None, year: int = None) -> st
     month = month or now.month
     year = year or now.year
 
-    month_str = str(month).zfill(2)
-    year_str = str(year)
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT amount FROM budgets
-        WHERE user_id = ? AND month = ? AND year = ?
-    """, (user_id, month, year))
-
-    budget_row = cursor.fetchone()
-    if not budget_row:
-        conn.close()
+    budget_doc = budgets_col.find_one({"user_id": user_id, "month": month, "year": year})
+    if not budget_doc:
         return f"❌ No budget set for '{user_id}' in {month}/{year}. Use set_budget to create one."
 
-    budget = budget_row[0]
+    budget = budget_doc["amount"]
 
-    cursor.execute("""
-        SELECT SUM(amount) FROM expenses
-        WHERE user_id = ?
-          AND strftime('%m', date) = ?
-          AND strftime('%Y', date) = ?
-    """, (user_id, month_str, year_str))
+    month_str = str(month).zfill(2)
+    year_str = str(year)
+    prefix = f"{year_str}-{month_str}"
 
-    spent_row = cursor.fetchone()
-    conn.close()
+    pipeline = [
+        {"$match": {"user_id": user_id, "date": {"$regex": f"^{prefix}"}}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+    ]
+    result_agg = list(expenses_col.aggregate(pipeline))
+    spent = result_agg[0]["total"] if result_agg else 0.0
 
-    spent = spent_row[0] or 0.0
     remaining = budget - spent
     pct_used = (spent / budget) * 100
 
@@ -383,29 +298,28 @@ def check_budget_status(user_id: str, month: int = None, year: int = None) -> st
 @mcp.tool()
 def get_spending_trend(user_id: str) -> str:
     """Get spending totals for the last 6 months for a user"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT strftime('%Y-%m', date) as month, SUM(amount)
-        FROM expenses
-        WHERE user_id = ?
-        GROUP BY month
-        ORDER BY month DESC
-        LIMIT 6
-    """, (user_id,))
-
-    rows = cursor.fetchall()
-    conn.close()
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": {"$substr": ["$date", 0, 7]},
+            "total": {"$sum": "$amount"}
+        }},
+        {"$sort": {"_id": -1}},
+        {"$limit": 6}
+    ]
+    rows = list(expenses_col.aggregate(pipeline))
 
     if not rows:
         return f"No spending data found for '{user_id}'"
 
+    rows = list(reversed(rows))
+    max_total = max(r["total"] for r in rows)
+
     result = f"📈 Spending Trend for '{user_id}' (Last 6 Months):\n\n"
-    for month_label, total in reversed(rows):
-        bar_len = int((total / max(r[1] for r in rows)) * 20)
+    for row in rows:
+        bar_len = int((row["total"] / max_total) * 20)
         bar = "█" * bar_len
-        result += f"{month_label}  {bar}  ${total:.2f}\n"
+        result += f"{row['_id']}  {bar}  ${row['total']:.2f}\n"
 
     logger.info(f"User '{user_id}' fetched spending trend")
     return result
@@ -423,16 +337,13 @@ def add_recurring_expense(user_id: str, amount: float, category: str, day_of_mon
     if err := validate_day_of_month(day_of_month):
         return err
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO recurring_expenses (user_id, amount, category, description, day_of_month)
-        VALUES (?, ?, ?, ?, ?)
-    """, (user_id, amount, category.strip(), description, day_of_month))
-
-    conn.commit()
-    conn.close()
+    recurring_col.insert_one({
+        "user_id": user_id,
+        "amount": amount,
+        "category": category.strip(),
+        "description": description,
+        "day_of_month": day_of_month
+    })
 
     logger.info(f"User '{user_id}' added recurring expense ${amount:.2f} in '{category}' on day {day_of_month}")
     return f"✅ Recurring expense added: ${amount:.2f} for {category} on day {day_of_month} of each month"
@@ -441,48 +352,36 @@ def add_recurring_expense(user_id: str, amount: float, category: str, day_of_mon
 @mcp.tool()
 def get_recurring_expenses(user_id: str) -> str:
     """List all recurring expenses for a user"""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT id, amount, category, description, day_of_month
-        FROM recurring_expenses
-        WHERE user_id = ?
-        ORDER BY day_of_month
-    """, (user_id,))
-
-    rows = cursor.fetchall()
-    conn.close()
+    rows = list(recurring_col.find({"user_id": user_id}).sort("day_of_month", 1))
 
     if not rows:
         return f"No recurring expenses found for '{user_id}'"
 
-    total = sum(r[1] for r in rows)
+    total = sum(r["amount"] for r in rows)
     result = f"🔁 Recurring Expenses for '{user_id}':\n\n"
-    for exp_id, amount, cat, desc, day in rows:
-        result += f"• [#{exp_id}] ${amount:.2f} - {cat} - Every month on day {day}\n"
-        if desc:
-            result += f"  Description: {desc}\n"
+    for row in rows:
+        exp_id = str(row["_id"])[-6:]
+        result += f"• [#{exp_id}] ${row['amount']:.2f} - {row['category']} - Every month on day {row['day_of_month']}\n"
+        if row.get("description"):
+            result += f"  Description: {row['description']}\n"
 
     result += f"\n🔢 Total Monthly Recurring: ${total:.2f}"
     return result
 
 
 @mcp.tool()
-def delete_recurring_expense(user_id: str, expense_id: int) -> str:
+def delete_recurring_expense(user_id: str, expense_id: str) -> str:
     """Delete a recurring expense by ID"""
-    conn = get_connection()
-    cursor = conn.cursor()
+    from bson import ObjectId
+    try:
+        result = recurring_col.delete_one({"_id": ObjectId(expense_id), "user_id": user_id})
+    except Exception:
+        return "❌ Invalid expense ID format"
 
-    cursor.execute("DELETE FROM recurring_expenses WHERE id = ? AND user_id = ?", (expense_id, user_id))
-    conn.commit()
-
-    if cursor.rowcount > 0:
-        conn.close()
+    if result.deleted_count > 0:
         logger.info(f"User '{user_id}' deleted recurring expense #{expense_id}")
         return f"✅ Recurring expense #{expense_id} deleted"
     else:
-        conn.close()
         return f"❌ Recurring expense #{expense_id} not found or doesn't belong to user '{user_id}'"
 
 
