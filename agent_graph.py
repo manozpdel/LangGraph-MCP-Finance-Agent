@@ -2,6 +2,7 @@
 
 import os
 import logging
+import requests as _requests
 from typing import Annotated, TypedDict, Sequence, Any, Optional
 
 import pydantic
@@ -20,7 +21,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-mcp_api_key = os.getenv("FASTMCP_KEY")
+mcp_api_key  = os.getenv("FASTMCP_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # ─────────────────────────────
 # MCP Server Configuration
@@ -28,22 +31,75 @@ mcp_api_key = os.getenv("FASTMCP_KEY")
 SERVERS = {
     "expense": {
         "transport": "streamable_http",
-        "url": "https://hidden-violet-butterfly.fastmcp.app/mcp",
+        "url": "https://unlikely-blue-starfish.fastmcp.app/mcp",
         "headers": {
             "Authorization": f"Bearer {mcp_api_key}"
         }
     }
 }
 
+_SB_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
 
-def build_system_prompt(user_id: str) -> str:
+
+# ─────────────────────────────
+# Auth — Direct Supabase REST
+# ─────────────────────────────
+async def mcp_register(name: str, username: str, password: str) -> str:
+    username = username.strip().lower()
+    res = _requests.get(
+        f"{SUPABASE_URL}/rest/v1/users",
+        headers=_SB_HEADERS,
+        params={"username": f"eq.{username}"}
+    )
+    if res.ok and res.json():
+        return f"Username '{username}' is already taken"
+
+    res = _requests.post(
+        f"{SUPABASE_URL}/rest/v1/users",
+        headers=_SB_HEADERS,
+        json={"name": name.strip(), "username": username, "password": password}
+    )
+    result = res.json()
+    if isinstance(result, list) and result and "id" in result[0]:
+        return f"Welcome, {name}! Your account has been created. You can now login with username '{username}'"
+    return f"Registration failed: {result}"
+
+
+async def mcp_login(username: str, password: str) -> str:
+    username = username.strip().lower()
+    res = _requests.get(
+        f"{SUPABASE_URL}/rest/v1/users",
+        headers=_SB_HEADERS,
+        params={"username": f"eq.{username}", "password": f"eq.{password}"}
+    )
+    if res.ok and res.json():
+        user = res.json()[0]
+        return (
+            f"Login successful!\n"
+            f"Welcome back, {user['name']}!\n"
+            f"User ID: {user['id']}\n"
+            f"Username: {user['username']}"
+        )
+    return "Invalid username or password"
+
+
+# ─────────────────────────────
+# System Prompt
+# ─────────────────────────────
+def build_system_prompt(username: str, name: str) -> str:
     return (
-        f"You are a helpful AI expense tracking assistant.\n\n"
-        f"The current user is: '{user_id}'\n\n"
-        f"IMPORTANT: The tools are already pre-configured for user '{user_id}'. "
-        f"Do NOT pass user_id to any tool — it is injected automatically.\n\n"
+        f"You are a helpful AI assistant. You can chat about any topic freely.\n\n"
+        f"The current logged-in user is: {name} (username: '{username}')\n\n"
+        f"When the user wants to track expenses, use the available tools. "
+        f"IMPORTANT: The tools are already pre-configured with the user's credentials. "
+        f"Do NOT pass username or password to any tool — they are injected automatically.\n\n"
 
-        f"## RULES — follow strictly:\n\n"
+        f"## EXPENSE TRACKING RULES:\n\n"
 
         f"### Adding expenses:\n"
         f"- When user says they spent money, call add_expense with amount and category.\n"
@@ -54,7 +110,7 @@ def build_system_prompt(user_id: str) -> str:
         f"or refers to a previous expense — this is an UPDATE, NOT a new expense.\n"
         f"- Step 1: Call get_expenses to fetch recent expenses and find the correct expense_id.\n"
         f"- Step 2: Call update_expense with that expense_id and the corrected amount/category.\n"
-        f"- NEVER call add_expense for a correction. NEVER.\n\n"
+        f"- NEVER call add_expense for a correction.\n\n"
 
         f"### Deleting expenses:\n"
         f"- Step 1: Call get_expenses to find the expense_id.\n"
@@ -62,7 +118,7 @@ def build_system_prompt(user_id: str) -> str:
 
         f"### General:\n"
         f"- For budget, summary, trends — call the appropriate tool directly.\n"
-        f"- For normal conversation, reply without tools.\n"
+        f"- For all other topics, respond naturally without using any tools.\n"
     )
 
 
@@ -74,7 +130,7 @@ class AgentState(TypedDict):
 
 
 # ─────────────────────────────
-# JSON Schema type → Python type mapping
+# JSON Schema type to Python type mapping
 # ─────────────────────────────
 PYTHON_TYPE_MAP = {
     "string": str,
@@ -86,7 +142,7 @@ PYTHON_TYPE_MAP = {
 }
 
 
-def _build_model_without_user_id(tool_name: str, tool) -> Any:
+def _build_model_without_credentials(tool_name: str, tool) -> Any:
     if isinstance(tool.args_schema, dict):
         schema = tool.args_schema
     elif hasattr(tool.args_schema, "model_json_schema"):
@@ -101,7 +157,7 @@ def _build_model_without_user_id(tool_name: str, tool) -> Any:
 
     fields = {}
     for field_name, field_info in properties.items():
-        if field_name == "user_id":
+        if field_name in ("username", "password"):
             continue
 
         py_type = PYTHON_TYPE_MAP.get(field_info.get("type", "string"), str)
@@ -119,28 +175,33 @@ def _build_model_without_user_id(tool_name: str, tool) -> Any:
     return pydantic.create_model(tool_name + "Input", **fields)
 
 
-def inject_user_id_into_tools(mcp_tools, user_id: str):
+def inject_credentials_into_tools(mcp_tools, username: str, password: str):
     wrapped = []
+    skip_tools = {"register_user", "login_user", "change_password"}
 
     for tool in mcp_tools:
-        original_coroutine = tool.coroutine
-        new_schema = _build_model_without_user_id(tool.name, tool)
+        if tool.name in skip_tools:
+            continue
 
-        def make_coroutine(fn, uid):
+        new_schema = _build_model_without_credentials(tool.name, tool)
+
+        # Capture tool in closure correctly
+        def make_coroutine(t, uname, pwd):
             async def wrapper(**kwargs):
                 kwargs = {k: v for k, v in kwargs.items() if v is not None}
-                kwargs["user_id"] = uid
-                return await fn(**kwargs)
+                kwargs["username"] = uname
+                kwargs["password"] = pwd
+                return await t.coroutine(**kwargs)
             return wrapper
 
         new_tool = StructuredTool(
             name=tool.name,
             description=tool.description,
-            coroutine=make_coroutine(original_coroutine, user_id),
+            coroutine=make_coroutine(tool, username, password),
             args_schema=new_schema,
         )
         wrapped.append(new_tool)
-        logger.info(f"Wrapped tool '{tool.name}' with user_id='{user_id}'")
+        logger.info(f"Wrapped tool '{tool.name}' with credentials for '{username}'")
 
     return wrapped
 
@@ -165,12 +226,12 @@ def should_continue(state: AgentState):
     return END
 
 
-async def build_app(user_id: str):
+async def build_app(username: str, password: str, name: str):
     client = MultiServerMCPClient(SERVERS)
     raw_tools = await client.get_tools()
     logger.info(f"Fetched {len(raw_tools)} tools from MCP server")
 
-    tools = inject_user_id_into_tools(raw_tools, user_id)
+    tools = inject_credentials_into_tools(raw_tools, username, password)
     llm_with_tools = llm.bind_tools(tools)
 
     workflow = StateGraph(AgentState)
@@ -186,11 +247,8 @@ async def build_app(user_id: str):
     return workflow.compile()
 
 
-# ─────────────────────────────
-# Public Function for UI
-# ─────────────────────────────
-async def run_agent(history, user_id: str):
-    app = await build_app(user_id)
+async def run_agent(history, username: str, password: str, name: str):
+    app = await build_app(username, password, name)
     final_state = None
 
     async for state in app.astream(
