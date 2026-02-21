@@ -22,7 +22,7 @@ Built with **LangGraph**, **FastMCP**, **Supabase**, and **Streamlit**, it featu
 
 ---
 
-## ✨ Features
+##  Features
 
 - **Natural Language Expense Tracking** — Add, update, and delete expenses by just describing them ("I spent $45 on groceries")
 - **Smart Update Detection** — The agent recognizes corrections ("actually it was $50") and updates existing records instead of creating duplicates
