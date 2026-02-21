@@ -1,15 +1,16 @@
 # agent_graph.py
+# core agent logic — handles MCP tool loading, auth, chat history, and the langgraph agent loop
 
 import os
+import json
 import logging
-import requests as _requests
 from typing import Annotated, TypedDict, Sequence, Any, Optional
 
 import pydantic
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 
 from langgraph.graph import StateGraph, END
@@ -21,13 +22,10 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-mcp_api_key  = os.getenv("FASTMCP_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+mcp_api_key = os.getenv("FASTMCP_KEY")
 
-# ─────────────────────────────
-# MCP Server Configuration
-# ─────────────────────────────
+
+# point to our hosted FastMCP server
 SERVERS = {
     "expense": {
         "transport": "streamable_http",
@@ -38,60 +36,111 @@ SERVERS = {
     }
 }
 
-_SB_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation"
-}
+
+async def get_mcp_tools() -> list:
+    # fresh client every time — keeps things simple and avoids stale connections
+    client = MultiServerMCPClient(SERVERS)
+    return await client.get_tools()
 
 
-# ─────────────────────────────
-# Auth — Direct Supabase REST
-# ─────────────────────────────
+def _find_tool(tools: list, name: str):
+    return next((t for t in tools if t.name == name), None)
+
+
+def _extract_mcp_result(result) -> str:
+    # MCP tools return a tuple like:
+    # ([{'type': 'text', 'text': '...'}], {'structured_content': ...})
+    # we just want the text string out of it
+    if isinstance(result, tuple):
+        result = result[0]
+    if isinstance(result, list) and result:
+        result = result[0]
+    if isinstance(result, dict):
+        return result.get("text", str(result))
+    return str(result)
+
+
+#Auth
+
+# these are called directly from the UI during login/register,
+# not exposed to the LLM as agent tools
+
 async def mcp_register(name: str, username: str, password: str) -> str:
-    username = username.strip().lower()
-    res = _requests.get(
-        f"{SUPABASE_URL}/rest/v1/users",
-        headers=_SB_HEADERS,
-        params={"username": f"eq.{username}"}
-    )
-    if res.ok and res.json():
-        return f"Username '{username}' is already taken"
-
-    res = _requests.post(
-        f"{SUPABASE_URL}/rest/v1/users",
-        headers=_SB_HEADERS,
-        json={"name": name.strip(), "username": username, "password": password}
-    )
-    result = res.json()
-    if isinstance(result, list) and result and "id" in result[0]:
-        return f"Welcome, {name}! Your account has been created. You can now login with username '{username}'"
-    return f"Registration failed: {result}"
+    tools = await get_mcp_tools()
+    tool = _find_tool(tools, "register_user")
+    if not tool:
+        return "Registration tool not available"
+    result = await tool.coroutine(name=name, username=username, password=password)
+    return _extract_mcp_result(result)
 
 
 async def mcp_login(username: str, password: str) -> str:
-    username = username.strip().lower()
-    res = _requests.get(
-        f"{SUPABASE_URL}/rest/v1/users",
-        headers=_SB_HEADERS,
-        params={"username": f"eq.{username}", "password": f"eq.{password}"}
+    tools = await get_mcp_tools()
+    tool = _find_tool(tools, "login_user")
+    if not tool:
+        return "Login tool not available"
+    result = await tool.coroutine(username=username, password=password)
+    return _extract_mcp_result(result)
+
+
+#Chat History
+
+# also called directly from the UI, not agent tools
+
+async def fetch_chat_history(username: str, password: str, limit: int = 100) -> list[dict]:
+    # returns messages as [{"role": "user"/"assistant", "content": "..."}]
+    # in chronological order, ready to be fed into the agent
+    tools = await get_mcp_tools()
+    tool = _find_tool(tools, "get_chat_history_raw")
+    if not tool:
+        return []
+
+    result = await tool.coroutine(username=username, password=password, limit=limit)
+    text = _extract_mcp_result(result)
+
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        # if parsing fails just return empty, not worth crashing over
+        return []
+
+
+async def save_chat_exchange_direct(username: str, password: str, user_message: str, assistant_message: str) -> bool:
+    # save both sides of the conversation after each turn
+    tools = await get_mcp_tools()
+    tool = _find_tool(tools, "save_chat_exchange")
+    if not tool:
+        return False
+
+    result = await tool.coroutine(
+        username=username,
+        password=password,
+        user_message=user_message,
+        assistant_message=assistant_message
     )
-    if res.ok and res.json():
-        user = res.json()[0]
-        return (
-            f"Login successful!\n"
-            f"Welcome back, {user['name']}!\n"
-            f"User ID: {user['id']}\n"
-            f"Username: {user['username']}"
-        )
-    return "Invalid username or password"
+    text = _extract_mcp_result(result)
+    logger.info(f"saved chat exchange for '{username}': {text}")
+    return "saved" in text.lower()
 
 
-# ─────────────────────────────
-# System Prompt
-# ─────────────────────────────
+async def clear_chat_history_direct(username: str, password: str) -> bool:
+    tools = await get_mcp_tools()
+    tool = _find_tool(tools, "clear_chat_history")
+    if not tool:
+        return False
+
+    result = await tool.coroutine(username=username, password=password)
+    text = _extract_mcp_result(result)
+    logger.info(f"cleared chat history for '{username}': {text}")
+    return "cleared" in text.lower()
+
+
+#System Prompt
+
 def build_system_prompt(username: str, name: str) -> str:
+    # this gets injected at the top of every conversation
+    # the rules here are important — without them the LLM tends to add duplicate expenses
+    # when the user says things like "actually it was $50 not $40"
     return (
         f"You are a helpful AI assistant. You can chat about any topic freely.\n\n"
         f"The current logged-in user is: {name} (username: '{username}')\n\n"
@@ -109,7 +158,7 @@ def build_system_prompt(username: str, name: str) -> str:
         f"- If the user says 'actually', 'correction', 'update', 'change', 'fix', 'wrong amount', "
         f"or refers to a previous expense — this is an UPDATE, NOT a new expense.\n"
         f"- Step 1: Call get_expenses to fetch recent expenses and find the correct expense_id.\n"
-        f"- Step 2: Call update_expense with that expense_id and the corrected amount/category.\n"
+        f"- Step 2: Call update_expense with that expense_id and the corrected values.\n"
         f"- NEVER call add_expense for a correction.\n\n"
 
         f"### Deleting expenses:\n"
@@ -122,16 +171,24 @@ def build_system_prompt(username: str, name: str) -> str:
     )
 
 
-# ─────────────────────────────
-# LangGraph State
-# ─────────────────────────────
+def build_history_as_messages(raw_history: list[dict], system_prompt: str) -> list[BaseMessage]:
+    # converts the flat list from the DB into proper langchain message objects
+    messages = [SystemMessage(content=system_prompt)]
+    for msg in raw_history:
+        if msg["role"] == "user":
+            messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            messages.append(AIMessage(content=msg["content"]))
+    return messages
+
+
+# LangGraph State 
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-# ─────────────────────────────
-# JSON Schema type to Python type mapping
-# ─────────────────────────────
+# maps JSON schema types to Python types for building pydantic models dynamically
 PYTHON_TYPE_MAP = {
     "string": str,
     "number": float,
@@ -143,6 +200,8 @@ PYTHON_TYPE_MAP = {
 
 
 def _build_model_without_credentials(tool_name: str, tool) -> Any:
+    # we strip username/password from every tool's schema before handing them to the LLM
+    # so the model never has to know or pass credentials — we inject them ourselves
     if isinstance(tool.args_schema, dict):
         schema = tool.args_schema
     elif hasattr(tool.args_schema, "model_json_schema"):
@@ -177,7 +236,14 @@ def _build_model_without_credentials(tool_name: str, tool) -> Any:
 
 def inject_credentials_into_tools(mcp_tools, username: str, password: str):
     wrapped = []
-    skip_tools = {"register_user", "login_user", "change_password"}
+
+    # skip auth and chat history tools — the LLM doesn't need these,
+    # they're handled directly by the UI
+    skip_tools = {
+        "register_user", "login_user", "change_password",
+        "save_chat_message", "save_chat_exchange",
+        "get_chat_history", "get_chat_history_raw", "clear_chat_history"
+    }
 
     for tool in mcp_tools:
         if tool.name in skip_tools:
@@ -185,9 +251,9 @@ def inject_credentials_into_tools(mcp_tools, username: str, password: str):
 
         new_schema = _build_model_without_credentials(tool.name, tool)
 
-        # Capture tool in closure correctly
         def make_coroutine(t, uname, pwd):
             async def wrapper(**kwargs):
+                # drop None values before injecting credentials
                 kwargs = {k: v for k, v in kwargs.items() if v is not None}
                 kwargs["username"] = uname
                 kwargs["password"] = pwd
@@ -201,14 +267,13 @@ def inject_credentials_into_tools(mcp_tools, username: str, password: str):
             args_schema=new_schema,
         )
         wrapped.append(new_tool)
-        logger.info(f"Wrapped tool '{tool.name}' with credentials for '{username}'")
+        logger.info(f"wrapped tool '{tool.name}' for user '{username}'")
 
     return wrapped
 
 
-# ─────────────────────────────
-# LLM
-# ─────────────────────────────
+#Agent
+
 llm = ChatGroq(model="llama-3.3-70b-versatile")
 
 
@@ -220,6 +285,8 @@ def make_call_model(llm_with_tools):
 
 
 def should_continue(state: AgentState):
+    # if the LLM wants to call a tool, route to the tool node
+    # otherwise we're done
     last_message = state["messages"][-1]
     if isinstance(last_message, AIMessage) and getattr(last_message, "tool_calls", None):
         return "tools"
@@ -227,13 +294,14 @@ def should_continue(state: AgentState):
 
 
 async def build_app(username: str, password: str, name: str):
-    client = MultiServerMCPClient(SERVERS)
-    raw_tools = await client.get_tools()
-    logger.info(f"Fetched {len(raw_tools)} tools from MCP server")
+    raw_tools = await get_mcp_tools()
+    logger.info(f"fetched {len(raw_tools)} tools from MCP server")
 
     tools = inject_credentials_into_tools(raw_tools, username, password)
     llm_with_tools = llm.bind_tools(tools)
 
+    # standard react-style agent loop:
+    # call model -> if tool needed, run it -> call model again -> repeat until done
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", make_call_model(llm_with_tools))
     workflow.add_node("tools", ToolNode(tools))
@@ -244,7 +312,9 @@ async def build_app(username: str, password: str, name: str):
         {"tools": "tools", END: END},
     )
     workflow.add_edge("tools", "agent")
-    return workflow.compile()
+    app = workflow.compile()
+    print(app)
+    return app
 
 
 async def run_agent(history, username: str, password: str, name: str):
@@ -257,10 +327,13 @@ async def run_agent(history, username: str, password: str, name: str):
     ):
         final_state = state
 
-    if final_state:
-        if "agent" in final_state:
-            return final_state["agent"]["messages"]
-        elif "tools" in final_state:
-            return final_state["tools"]["messages"]
+    if not final_state:
+        return []
+
+    # pull messages from whichever node ran last
+    if "agent" in final_state:
+        return final_state["agent"]["messages"]
+    elif "tools" in final_state:
+        return final_state["tools"]["messages"]
 
     return []

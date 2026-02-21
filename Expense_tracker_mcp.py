@@ -10,33 +10,36 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 from fastmcp import FastMCP
 
-# --------------------- LOGGING SETUP ---------------------
 
+# Logging Setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# --------------------- INIT ---------------------
 
+# Init
 mcp = FastMCP("ExpenseTracker")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# crash early if the env vars aren't set, better than a cryptic error later
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables must be set")
 
+# these go on every request to supabase
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "return=representation"
+    "Prefer": "return=representation"  # tells supabase to return the created/updated row
 }
 
 
-# --------------------- TABLE INIT ---------------------
+# Table Init
 
 def init_tables():
-    """Create tables if they do not exist using Supabase SQL endpoint"""
+    # create all tables if they don't exist yet, supabase needs this on first run
+    # if you've already set these up manually in the SQL editor you can ignore any warnings here
     sql = """
     CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -61,7 +64,7 @@ def init_tables():
         month INTEGER NOT NULL,
         year INTEGER NOT NULL,
         amount FLOAT NOT NULL,
-        UNIQUE(user_id, month, year)
+        UNIQUE(user_id, month, year)  -- one budget per user per month
     );
 
     CREATE TABLE IF NOT EXISTS recurring_expenses (
@@ -88,7 +91,7 @@ def init_tables():
         json={"query": sql}
     )
 
-    # Fallback: use pg endpoint directly
+    # try the pg endpoint directly if the rpc call didn't work
     if not res.ok:
         res = requests.post(
             f"{SUPABASE_URL}/pg/query",
@@ -106,7 +109,9 @@ def init_tables():
 init_tables()
 
 
-# --------------------- SUPABASE HELPERS ---------------------
+# Supabase Helpers
+# thin wrappers so we don't repeat requests boilerplate everywhere
+# all functions return empty list / empty dict on failure instead of raising
 
 def sb_get(table: str, params: dict = {}) -> list:
     res = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=HEADERS, params=params)
@@ -115,6 +120,7 @@ def sb_get(table: str, params: dict = {}) -> list:
 def sb_post(table: str, data: dict) -> dict:
     res = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=HEADERS, json=data)
     result = res.json()
+    # supabase returns a list even for single inserts, so unwrap it
     return result[0] if isinstance(result, list) and result else result
 
 def sb_patch(table: str, params: dict, data: dict) -> dict:
@@ -123,24 +129,27 @@ def sb_patch(table: str, params: dict, data: dict) -> dict:
     return result[0] if isinstance(result, list) and result else result
 
 def sb_delete(table: str, params: dict) -> int:
+    # need count=exact in Prefer header to get back how many rows were deleted
     h = {**HEADERS, "Prefer": "count=exact"}
     res = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}", headers=h, params=params)
     count = res.headers.get("content-range", "0")
     return int(count.split("/")[-1]) if "/" in count else (1 if res.ok else 0)
 
 def sb_upsert(table: str, data: dict, on_conflict: str) -> dict:
+    # merge-duplicates means update on conflict rather than error
     h = {**HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"}
     res = requests.post(f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}", headers=h, json=data)
     result = res.json()
     return result[0] if isinstance(result, list) and result else result
 
 def auth(username: str, password: str):
-    """Authenticate user, return user dict or None"""
+    # returns the user row or None — called at the top of every tool that needs a logged-in user
     rows = sb_get("users", {"username": f"eq.{username.strip().lower()}", "password": f"eq.{password}"})
     return rows[0] if rows else None
 
 
-# --------------------- INPUT VALIDATION ---------------------
+# Input Validation
+# small helpers to keep the tool functions clean, return an error string or None
 
 def validate_amount(amount: float) -> Optional[str]:
     if amount <= 0:
@@ -158,7 +167,7 @@ def validate_day_of_month(day: int) -> Optional[str]:
     return None
 
 
-# --------------------- AUTH TOOLS ---------------------
+# Auth Tools
 
 @mcp.tool()
 def register_user(name: str, username: str, password: str) -> str:
@@ -170,13 +179,14 @@ def register_user(name: str, username: str, password: str) -> str:
     if len(password) < 6:
         return "Password must be at least 6 characters"
 
+    # make sure username isn't already taken before inserting
     existing = sb_get("users", {"username": f"eq.{username.strip().lower()}"})
     if existing:
         return f"Username '{username}' is already taken"
 
     result = sb_post("users", {
         "name": name.strip(),
-        "username": username.strip().lower(),
+        "username": username.strip().lower(),  # always store lowercase
         "password": password
     })
 
@@ -193,6 +203,7 @@ def login_user(username: str, password: str) -> str:
     if not user:
         return "Invalid username or password"
     logger.info(f"User '{username}' logged in")
+    # return enough info so the frontend can populate session state
     return (
         f"Login successful!\n"
         f"Welcome back, {user['name']}!\n"
@@ -204,6 +215,7 @@ def login_user(username: str, password: str) -> str:
 @mcp.tool()
 def change_password(username: str, old_password: str, new_password: str) -> str:
     """Change password for a user"""
+    # auth with old password first to confirm identity
     user = auth(username, old_password)
     if not user:
         return "Invalid username or old password"
@@ -213,7 +225,7 @@ def change_password(username: str, old_password: str, new_password: str) -> str:
     return "Password changed successfully"
 
 
-# --------------------- EXPENSE TOOLS ---------------------
+# Expense Tools
 
 @mcp.tool()
 def add_expense(username: str, password: str, amount: float, category: str, description: str = "") -> str:
@@ -231,7 +243,7 @@ def add_expense(username: str, password: str, amount: float, category: str, desc
         "category": category.strip(),
         "description": description,
         "date": now.isoformat(),
-        "timestamp": now.timestamp()
+        "timestamp": now.timestamp()  # float timestamp for easy sorting
     })
 
     logger.info(f"User '{username}' added expense ${amount:.2f} in '{category}'")
@@ -247,6 +259,7 @@ def get_expenses(username: str, password: str, category: str = None, limit: int 
 
     params = {"user_id": f"eq.{user['id']}", "order": "timestamp.desc", "limit": str(limit)}
     if category:
+        # ilike for case-insensitive category matching
         params["category"] = f"ilike.{category}"
 
     rows = sb_get("expenses", params)
@@ -269,6 +282,7 @@ def get_total_by_category(username: str, password: str) -> str:
     if not user:
         return "Invalid username or password"
 
+    # grab all expenses and group them in python, supabase free tier doesn't support group-by via rest
     rows = sb_get("expenses", {"user_id": f"eq.{user['id']}"})
     if not rows:
         return "No expenses recorded yet"
@@ -293,6 +307,7 @@ def delete_expense(username: str, password: str, expense_id: int) -> str:
     if not user:
         return "Invalid username or password"
 
+    # filter by user_id too so users can't delete each other's expenses
     count = sb_delete("expenses", {"id": f"eq.{expense_id}", "user_id": f"eq.{user['id']}"})
     if count > 0:
         return f"Expense #{expense_id} deleted successfully"
@@ -306,6 +321,7 @@ def update_expense(username: str, password: str, expense_id: int, amount: float 
     if not user:
         return "Invalid username or password"
 
+    # only validate fields that were actually passed in
     if amount is not None:
         if err := validate_amount(amount): return err
     if category is not None:
@@ -315,6 +331,7 @@ def update_expense(username: str, password: str, expense_id: int, amount: float 
     if not existing:
         return f"Expense #{expense_id} not found or does not belong to you"
 
+    # build the update dict dynamically so we don't overwrite fields with None
     updates = {}
     if amount is not None: updates["amount"] = amount
     if category is not None: updates["category"] = category.strip()
@@ -332,11 +349,13 @@ def get_monthly_summary(username: str, password: str, month: int = None, year: i
     if not user:
         return "Invalid username or password"
 
+    # default to current month/year if not specified
     now = datetime.now()
     month = month or now.month
     year = year or now.year
     prefix = f"{year}-{str(month).zfill(2)}"
 
+    # filter by date prefix string since we store dates as isoformat text
     rows = sb_get("expenses", {"user_id": f"eq.{user['id']}", "date": f"like.{prefix}%"})
     if not rows:
         return f"No expenses found for {month}/{year}"
@@ -353,7 +372,7 @@ def get_monthly_summary(username: str, password: str, month: int = None, year: i
     return result
 
 
-# --------------------- BUDGET TOOLS ---------------------
+# Budget Tools
 
 @mcp.tool()
 def set_budget(username: str, password: str, amount: float, month: int = None, year: int = None) -> str:
@@ -363,10 +382,13 @@ def set_budget(username: str, password: str, amount: float, month: int = None, y
         return "Invalid username or password"
 
     if err := validate_amount(amount): return err
+
+    # default to current month/year if not passed
     now = datetime.now()
     month = month or now.month
     year = year or now.year
 
+    # upsert so calling this twice just updates the budget instead of erroring
     sb_upsert("budgets", {"user_id": user["id"], "month": month, "year": year, "amount": amount}, "user_id,month,year")
     return f"Budget set to ${amount:.2f} for {month}/{year}"
 
@@ -397,6 +419,7 @@ def check_budget_status(username: str, password: str, month: int = None, year: i
     result = f"Budget Status for '{user['name']}' - {month}/{year}:\n\n"
     result += f"Budget:    ${budget:.2f}\nSpent:     ${spent:.2f} ({pct_used:.1f}%)\nRemaining: ${remaining:.2f}\n"
 
+    # give the user a heads up if they're getting close or have gone over
     if spent > budget:
         result += "\nWARNING: You have EXCEEDED your budget!"
     elif pct_used >= 80:
@@ -406,7 +429,7 @@ def check_budget_status(username: str, password: str, month: int = None, year: i
     return result
 
 
-# --------------------- SPENDING TREND ---------------------
+# Spending Trend
 
 @mcp.tool()
 def get_spending_trend(username: str, password: str) -> str:
@@ -419,14 +442,17 @@ def get_spending_trend(username: str, password: str) -> str:
     if not rows:
         return "No spending data found"
 
+    # group by year-month string (e.g. "2024-03")
     monthly = {}
     for row in rows:
         key = row["date"][:7]
         monthly[key] = monthly.get(key, 0) + row["amount"]
 
+    # take only the 6 most recent months and flip to chronological order for the chart
     sorted_months = sorted(monthly.keys(), reverse=True)[:6]
     sorted_months = list(reversed(sorted_months))
 
+    # scale the bar chart relative to the highest-spending month
     max_total = max(monthly[m] for m in sorted_months)
     result = f"Spending Trend for '{user['name']}' (Last 6 Months):\n\n"
     for m in sorted_months:
@@ -435,7 +461,7 @@ def get_spending_trend(username: str, password: str) -> str:
     return result
 
 
-# --------------------- RECURRING EXPENSES ---------------------
+# Recurring Expenses
 
 @mcp.tool()
 def add_recurring_expense(username: str, password: str, amount: float, category: str, day_of_month: int, description: str = "") -> str:
@@ -463,6 +489,7 @@ def get_recurring_expenses(username: str, password: str) -> str:
     if not user:
         return "Invalid username or password"
 
+    # order by day_of_month so it reads like a calendar
     rows = sb_get("recurring_expenses", {"user_id": f"eq.{user['id']}", "order": "day_of_month.asc"})
     if not rows:
         return "No recurring expenses found"
@@ -490,7 +517,7 @@ def delete_recurring_expense(username: str, password: str, expense_id: int) -> s
     return f"Recurring expense #{expense_id} not found or does not belong to you"
 
 
-# --------------------- CHAT HISTORY TOOLS ---------------------
+# Chat History Tools
 
 @mcp.tool()
 def save_chat_message(username: str, password: str, role: str, content: str) -> str:
@@ -535,6 +562,7 @@ def save_chat_exchange(username: str, password: str, user_message: str, assistan
     ts = now.timestamp()
     date_str = now.isoformat()
 
+    # save both messages with the same timestamp base
     sb_post("chat_history", {
         "user_id": user["id"],
         "role": "user",
@@ -546,7 +574,7 @@ def save_chat_exchange(username: str, password: str, user_message: str, assistan
         "user_id": user["id"],
         "role": "assistant",
         "content": assistant_message.strip(),
-        "timestamp": ts + 0.001,   # keep ordering deterministic
+        "timestamp": ts + 0.001,  # tiny offset so ordering stays deterministic
         "date": date_str
     })
     return "Chat exchange saved"
@@ -566,7 +594,7 @@ def get_chat_history(username: str, password: str, limit: int = 50) -> str:
     if limit < 1 or limit > 200:
         return "limit must be between 1 and 200"
 
-    # Fetch most recent `limit` rows ordered descending, then reverse for chronological order
+    # fetch descending then reverse so we get oldest-first in the output
     rows = sb_get("chat_history", {
         "user_id": f"eq.{user['id']}",
         "order": "timestamp.desc",
@@ -576,7 +604,7 @@ def get_chat_history(username: str, password: str, limit: int = 50) -> str:
     if not rows:
         return "No chat history found"
 
-    rows = list(reversed(rows))   # chronological order
+    rows = list(reversed(rows))  # flip to chronological order
 
     result = f"Chat History for '{user['name']}' ({len(rows)} messages):\n\n"
     for row in rows:
@@ -590,9 +618,9 @@ def get_chat_history(username: str, password: str, limit: int = 50) -> str:
 @mcp.tool()
 def get_chat_history_raw(username: str, password: str, limit: int = 50) -> str:
     """
-    Retrieve chat history as a JSON-serialisable string of message dicts
-    [{"role": "user"|"assistant", "content": "...""}, ...] in chronological order.
-    Use this when you need to reconstruct LangChain/LLM message objects on login.
+    Retrieve chat history as a JSON string of message dicts
+    [{"role": "user"|"assistant", "content": "..."}] in chronological order.
+    Use this when rebuilding LangChain message objects on login.
     """
     import json
 
@@ -609,10 +637,11 @@ def get_chat_history_raw(username: str, password: str, limit: int = 50) -> str:
         "limit": str(limit)
     })
 
+    # return empty JSON array instead of an error string so callers can json.loads() safely
     if not rows:
         return "[]"
 
-    rows = list(reversed(rows))
+    rows = list(reversed(rows))  # chronological order
     messages = [{"role": r["role"], "content": r["content"]} for r in rows]
     return json.dumps(messages)
 
@@ -628,7 +657,6 @@ def clear_chat_history(username: str, password: str) -> str:
     return "Chat history cleared"
 
 
-# --------------------- RUN SERVER ---------------------
-
+# Run Server
 if __name__ == "__main__":
     mcp.run(transport='http', host="0.0.0.0", port=8000)

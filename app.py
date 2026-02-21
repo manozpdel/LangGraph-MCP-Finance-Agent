@@ -1,111 +1,26 @@
-# app.py
-
 import asyncio
 import threading
 import streamlit as st
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from agent_graph import run_agent, build_system_prompt, mcp_login, mcp_register
-
-
-# ─────────────────────────────
-# Page Config
-# ─────────────────────────────
-st.set_page_config(
-    page_title="Expense Tracker AI",
-    layout="centered"
+from agent_graph import (
+    run_agent,
+    build_system_prompt,
+    build_history_as_messages,
+    mcp_login,
+    mcp_register,
+    fetch_chat_history,
+    save_chat_exchange_direct,
 )
 
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
-}
-
-#MainMenu, footer, header { visibility: hidden; }
-
-.stApp {
-    background: #ffffff;
-    color: #111111;
-}
-
-.stTextInput > div > div > input {
-    border: 1px solid #d1d5db !important;
-    border-radius: 8px !important;
-    padding: 0.6rem 0.9rem !important;
-    font-size: 0.9rem !important;
-    background: #ffffff !important;
-    color: #111111 !important;
-}
-.stTextInput > div > div > input:focus {
-    border-color: #111111 !important;
-    box-shadow: none !important;
-}
-.stTextInput label {
-    font-size: 0.82rem !important;
-    font-weight: 500 !important;
-    color: #374151 !important;
-}
-
-.stButton > button {
-    border-radius: 8px !important;
-    font-size: 0.9rem !important;
-    font-weight: 500 !important;
-    padding: 0.55rem 1.2rem !important;
-    transition: all 0.15s;
-}
-.stButton > button[kind="primary"] {
-    background: #111111 !important;
-    color: #ffffff !important;
-    border: none !important;
-    width: 100%;
-}
-.stButton > button[kind="primary"]:hover {
-    background: #333333 !important;
-}
-.stButton > button[kind="secondary"] {
-    background: #ffffff !important;
-    color: #111111 !important;
-    border: 1px solid #d1d5db !important;
-    width: 100%;
-}
-.stButton > button[kind="secondary"]:hover {
-    background: #f9fafb !important;
-}
-
-[data-testid="stSidebar"] {
-    background: #f9fafb !important;
-    border-right: 1px solid #e5e7eb !important;
-}
-
-[data-testid="stChatMessage"] {
-    border-radius: 10px !important;
-    margin-bottom: 0.4rem;
-}
-
-[data-testid="stChatInput"] textarea {
-    border: 1px solid #d1d5db !important;
-    border-radius: 8px !important;
-    font-size: 0.9rem !important;
-}
-
-.stAlert {
-    border-radius: 8px !important;
-    font-size: 0.87rem !important;
-}
-
-.stSpinner > div {
-    border-top-color: #111111 !important;
-}
-</style>
-""", unsafe_allow_html=True)
+# Page Config
+st.set_page_config(page_title="Expense Tracker AI", layout="centered")
 
 
-# ─────────────────────────────
 # Helpers
-# ─────────────────────────────
+
+# run async functions from sync context (streamlit doesn't play well with asyncio)
 def run_async(coro):
     result = None
     exception = None
@@ -124,11 +39,13 @@ def run_async(coro):
     t = threading.Thread(target=thread_target)
     t.start()
     t.join()
+
     if exception:
         raise exception
     return result
 
 
+# AI sometimes returns content as a list of blocks, this just pulls the text out
 def extract_text(content):
     if isinstance(content, list):
         return "\n".join(
@@ -139,9 +56,48 @@ def extract_text(content):
     return content
 
 
-# ─────────────────────────────
+# the DB stores messages as a flat list, we need pairs for the sidebar thread view
+def raw_to_pairs(raw: list[dict]) -> list[tuple[str, str]]:
+    pairs = []
+    i = 0
+    while i < len(raw):
+        msg = raw[i]
+        if msg["role"] == "user":
+            user_content = msg["content"]
+            assistant_content = ""
+            if i + 1 < len(raw) and raw[i + 1]["role"] == "assistant":
+                assistant_content = raw[i + 1]["content"]
+                i += 2
+            else:
+                i += 1
+            pairs.append((user_content, assistant_content))
+        else:
+            i += 1
+    return pairs
+
+
+def start_new_chat():
+    # just reset everything, history stays in the DB/sidebar
+    system_prompt = build_system_prompt(st.session_state.username, st.session_state.name)
+    st.session_state.history = [SystemMessage(content=system_prompt)]
+    st.session_state.active_thread = -1
+
+
+def load_thread(pairs: list[tuple[str, str]], up_to_idx: int):
+    # rebuild the conversation up to the clicked message so user can continue from there
+    raw_for_thread = []
+    for u, a in pairs[: up_to_idx + 1]:
+        raw_for_thread.append({"role": "user", "content": u})
+        if a:
+            raw_for_thread.append({"role": "assistant", "content": a})
+
+    system_prompt = build_system_prompt(st.session_state.username, st.session_state.name)
+    st.session_state.history = build_history_as_messages(raw_for_thread, system_prompt)
+    st.session_state.active_thread = up_to_idx
+
+
 # Session State Defaults
-# ─────────────────────────────
+# set up all the keys we need upfront so we don't get KeyErrors later
 defaults = {
     "logged_in": False,
     "username": "",
@@ -150,15 +106,15 @@ defaults = {
     "history": [],
     "guest_history": [],
     "page": "chat",
+    "raw_history": [],
+    "active_thread": -1,  # -1 means new chat, anything else is an index into pairs
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-# ─────────────────────────────
-# GUEST CHAT
-# ─────────────────────────────
+# Guest Chat
 def render_guest_chat():
     with st.sidebar:
         st.markdown("### Expense Tracker AI")
@@ -177,6 +133,7 @@ def render_guest_chat():
     st.caption("You are chatting as a guest. Login to save and track your expenses.")
     st.info("Expense tracking features require login. Feel free to chat on any topic!")
 
+    # show whatever messages we have so far
     for msg in st.session_state.guest_history:
         if isinstance(msg, HumanMessage):
             with st.chat_message("user"):
@@ -187,7 +144,6 @@ def render_guest_chat():
                     st.markdown(extract_text(msg.content))
 
     user_text = st.chat_input("Ask me anything...")
-
     if user_text:
         with st.chat_message("user"):
             st.markdown(user_text)
@@ -195,9 +151,10 @@ def render_guest_chat():
 
         with st.spinner("Thinking..."):
             from langchain_groq import ChatGroq
-            from langchain_core.messages import SystemMessage as SM
             llm = ChatGroq(model="llama-3.3-70b-versatile")
-            guest_system = SM(content=(
+
+            # simple system prompt for guests, nudges them to login for expense stuff
+            guest_system = SystemMessage(content=(
                 "You are a helpful AI assistant. Chat freely on any topic. "
                 "If the user asks to track, save, or manage expenses, politely tell them "
                 "they need to login first to use expense tracking features."
@@ -210,9 +167,7 @@ def render_guest_chat():
         st.rerun()
 
 
-# ─────────────────────────────
-# LOGIN PAGE
-# ─────────────────────────────
+# Login Page
 def render_login():
     with st.sidebar:
         st.markdown("### Expense Tracker AI")
@@ -238,19 +193,29 @@ def render_login():
                 result = run_async(mcp_login(username.strip().lower(), password))
 
             if "Login successful" in result or "Welcome back" in result:
+                # try to pull the actual name from the response message
                 name = username
                 for line in result.split("\n"):
                     if "Welcome back" in line:
                         name = line.replace("Welcome back,", "").replace("!", "").strip()
                         break
 
+                with st.spinner("Loading your history..."):
+                    raw_history = run_async(
+                        fetch_chat_history(username.strip().lower(), password, limit=200)
+                    )
+
                 st.session_state.logged_in = True
                 st.session_state.username = username.strip().lower()
                 st.session_state.password = password
                 st.session_state.name = name
-                st.session_state.history = [
-                    SystemMessage(content=build_system_prompt(username.strip().lower(), name))
-                ]
+                st.session_state.raw_history = raw_history
+
+                # start fresh, old chats are accessible via sidebar
+                system_prompt = build_system_prompt(username.strip().lower(), name)
+                st.session_state.history = [SystemMessage(content=system_prompt)]
+                st.session_state.active_thread = -1
+
                 st.session_state.page = "chat"
                 st.rerun()
             else:
@@ -263,9 +228,7 @@ def render_login():
         st.rerun()
 
 
-# ─────────────────────────────
-# REGISTER PAGE
-# ─────────────────────────────
+# Register Page
 def render_register():
     with st.sidebar:
         st.markdown("### Expense Tracker AI")
@@ -310,44 +273,55 @@ def render_register():
         st.rerun()
 
 
-# ─────────────────────────────
-# LOGGED-IN CHAT
-# ─────────────────────────────
+# Logged-in Chat
 def render_chat():
+    raw = st.session_state.get("raw_history", [])
+    pairs = raw_to_pairs(raw)
+    active = st.session_state.get("active_thread", -1)
+
     with st.sidebar:
         st.markdown(f"### {st.session_state.name}")
         st.caption(f"@{st.session_state.username}")
         st.divider()
-        st.markdown("**What you can do:**")
-        st.caption("""
-- "I spent $50 on food"
-- "Show my recent expenses"
-- "Monthly summary"
-- "Set budget to $500"
-- "How is my budget?"
-- "Show spending trend"
-- "Add Netflix $15 on day 5"
-- "Actually that was $75"
-- Any general question
-        """)
+
+        # highlight the new chat button when we're actually in a new chat
+        if active == -1:
+            if st.button("✏️  New Chat", type="primary", use_container_width=True):
+                start_new_chat()
+                st.rerun()
+        else:
+            if st.button("✏️  New Chat", type="secondary", use_container_width=True):
+                start_new_chat()
+                st.rerun()
+
+        if pairs:
+            st.write("")
+            st.caption("Previous chats")
+            for idx, (user_msg, _) in enumerate(pairs):
+                # truncate long messages so the sidebar doesn't get ugly
+                preview = "💬  " + user_msg[:36] + ("…" if len(user_msg) > 36 else "")
+                is_active = (active == idx)
+                btn_type = "primary" if is_active else "secondary"
+                if st.button(preview, key=f"thread_{idx}", type=btn_type, use_container_width=True):
+                    load_thread(pairs, idx)
+                    st.rerun()
+
         st.divider()
-        if st.button("Clear Chat", type="secondary", use_container_width=True):
-            st.session_state.history = [
-                SystemMessage(content=build_system_prompt(
-                    st.session_state.username, st.session_state.name
-                ))
-            ]
-            st.rerun()
         if st.button("Logout", type="secondary", use_container_width=True):
-            for key in ["logged_in", "username", "password", "name", "history"]:
+            for key in ["logged_in", "username", "password", "name",
+                        "history", "raw_history", "active_thread"]:
                 st.session_state.pop(key, None)
             st.session_state.page = "chat"
             st.session_state.guest_history = []
             st.rerun()
 
-    st.title(f"Hey, {st.session_state.name.split()[0]}!")
-    st.caption("Chat freely or track your expenses.")
+    st.title("Expense Tracker AI")
+    if active == -1:
+        st.caption("Start a new conversation below.")
+    else:
+        st.caption("Viewing a previous thread — continue the conversation below.")
 
+    # render the current conversation
     for msg in st.session_state.history:
         if isinstance(msg, HumanMessage):
             with st.chat_message("user"):
@@ -373,22 +347,43 @@ def render_chat():
                 st.session_state.name
             ))
 
+        # add new messages to history and grab the last assistant reply for saving
+        assistant_reply = ""
         for msg in new_messages:
             if msg not in st.session_state.history:
                 st.session_state.history.append(msg)
+            if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                assistant_reply = extract_text(msg.content)
 
+        # show only the first real assistant message (skip tool call messages)
         for msg in new_messages:
             if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
                 with st.chat_message("assistant"):
                     st.markdown(extract_text(msg.content))
                 break
 
+        if assistant_reply:
+            # save to DB so it shows up in sidebar next time
+            run_async(save_chat_exchange_direct(
+                st.session_state.username,
+                st.session_state.password,
+                user_text,
+                assistant_reply
+            ))
+
+            # keep local raw_history in sync so we don't need a full page reload
+            st.session_state.raw_history.append({"role": "user", "content": user_text})
+            st.session_state.raw_history.append({"role": "assistant", "content": assistant_reply})
+
+            # move active thread pointer to the latest exchange
+            updated_pairs = raw_to_pairs(st.session_state.raw_history)
+            st.session_state.active_thread = len(updated_pairs) - 1
+
         st.rerun()
 
 
-# ─────────────────────────────
-# ROUTER
-# ─────────────────────────────
+# Router
+# simple routing based on login state and which page we're on
 if st.session_state.logged_in:
     render_chat()
 elif st.session_state.page == "login":
